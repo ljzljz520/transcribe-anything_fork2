@@ -38,6 +38,8 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Optional
 
+from transcribe_anything.publish import is_internal_name
+
 LOG = logging.getLogger("transcribe_anything.server")
 
 DEFAULT_PORT = 8765
@@ -312,7 +314,9 @@ class JobStore:
         path = Path(job.artifact_dir)
         if not path.is_dir():
             return []
-        return sorted(p.name for p in path.iterdir() if p.is_file())
+        # Exclude dot-prefixed round-mechanism bookkeeping (.staging-*,
+        # journal, lock dir) — only published artifacts are ever exposed.
+        return sorted(p.name for p in path.iterdir() if p.is_file() and not is_internal_name(p.name))
 
     def _run_worker(self) -> None:
         while not self._stop.is_set():

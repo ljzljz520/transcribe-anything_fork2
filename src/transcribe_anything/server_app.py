@@ -44,6 +44,8 @@ from fastapi import (  # noqa: F401
 )
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
+from transcribe_anything.publish import is_internal_name
+
 # Re-export pure-logic surface so test modules and external callers keep
 # importing from ``server_app`` after the file split.
 from transcribe_anything.server_config import (
@@ -314,6 +316,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown job")
         if "/" in filename or "\\" in filename or filename.startswith(".."):
             raise HTTPException(status_code=400, detail="invalid filename")
+        if is_internal_name(filename):
+            # Never serve round-mechanism bookkeeping (.staging-*, journal).
+            raise HTTPException(status_code=404, detail="artifact not found")
         path = Path(job.artifact_dir) / filename
         if not path.is_file():
             raise HTTPException(status_code=404, detail="artifact not found")
@@ -325,7 +330,10 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail="unknown job")
         artifact_dir = Path(job.artifact_dir)
-        files = sorted(p for p in artifact_dir.iterdir() if p.is_file()) if artifact_dir.is_dir() else []
+        # Same filtering as the job manifest: internal dot-entries and
+        # directories (e.g. the upload's _input/) are excluded.
+        files = [artifact_dir / name for name in store.list_artifacts(job)]
+        files = [f for f in files if f.is_file()]
         if not files:
             raise HTTPException(status_code=404, detail="no artifacts available for this job")
         buf = io.BytesIO()

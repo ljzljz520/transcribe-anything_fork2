@@ -22,6 +22,14 @@ from typing import Any, Optional
 
 import httpx
 
+from transcribe_anything.publish import (
+    ArtifactValidationError,
+    StagedRound,
+    commit_round,
+    staged_round,
+    validate_staging,
+)
+
 
 class RemoteTranscriberError(Exception):
     """Raised when a remote daemon rejects or fails a transcription request."""
@@ -66,6 +74,103 @@ def _collect_options(
     if embed:
         options["embed"] = True
     return options
+
+
+# ---------------------------------------------------------------------------
+# Artifact download staging (shared by sync and async clients)
+# ---------------------------------------------------------------------------
+
+
+def _expected_content_length(response: Any) -> int | None:
+    raw = response.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _verify_downloaded(part: Path, name: str, total: int, expected_length: int | None) -> None:
+    """Validate one finished artifact download before it leaves staging."""
+    if total == 0:
+        raise RemoteTranscriberError(f"downloaded empty artifact: {name}")
+    if expected_length is not None and total != expected_length:
+        raise RemoteTranscriberError(f"download truncated for artifact {name}: got {total} bytes, " f"expected {expected_length}")
+
+
+def _publish_downloaded_round(stage: StagedRound, expected_names: list) -> None:
+    """Validate the downloaded set and atomically publish it.
+
+    Uses the exact same staging / validate / commit protocol as local
+    transcription runs, so stale managed files are removed and user
+    files are preserved identically on both paths.
+    """
+    try:
+        staged_names = {p.name for p in stage.path.iterdir() if p.is_file()}
+        expected = set(expected_names)
+        if staged_names != expected:
+            raise RemoteTranscriberError("downloaded artifact set mismatch: " f"missing={sorted(expected - staged_names)}, " f"extra={sorted(staged_names - expected)}")
+        validate_staging(stage)
+        commit_round(stage)
+    except ArtifactValidationError as exc:
+        raise RemoteTranscriberError(str(exc)) from exc
+    except OSError as exc:
+        # Staging vanished or a replace/unlink failed mid-publish; the
+        # staging context sweeps the residue and the previous complete
+        # round stays in place. Keep the remote contract: never leak a
+        # raw filesystem error to the caller.
+        raise RemoteTranscriberError(f"failed to publish downloaded round: {exc}") from exc
+
+
+def _download_artifact_sync(client: httpx.Client, base_url: str, job_id: str, name: str, stage: StagedRound) -> None:
+    """Stream one artifact into staging (sync client), via a ``.part`` name."""
+    part = stage.path / f"{name}.part"
+    total = 0
+    expected_length: int | None = None
+    try:
+        with client.stream("GET", f"{base_url}/v1/jobs/{job_id}/artifacts/{name}") as r:
+            if r.status_code >= 400:
+                raise RemoteTranscriberError(f"failed to download artifact {name}: {r.status_code} {r.text}")
+            expected_length = _expected_content_length(r)
+            with part.open("wb") as fh:
+                for chunk in r.iter_bytes():
+                    fh.write(chunk)
+                    total += len(chunk)
+    except RemoteTranscriberError:
+        raise
+    except (httpx.HTTPError, OSError, RuntimeError) as exc:
+        # The boundary covers iteration *and* stream close: transports
+        # surface socket/framing errors (httpx.HTTPError/OSError), and
+        # in-process test portals surface the server-side break as a
+        # RuntimeError when the stream context exits.
+        raise RemoteTranscriberError(f"download interrupted for artifact {name}: {exc}") from exc
+    _verify_downloaded(part, name, total, expected_length)
+    os.replace(part, stage.path / name)
+
+
+async def _download_artifact_async(client: httpx.AsyncClient, base_url: str, job_id: str, name: str, stage: StagedRound) -> None:
+    """Stream one artifact into staging (async client), via a ``.part`` name."""
+    part = stage.path / f"{name}.part"
+    total = 0
+    expected_length: int | None = None
+    try:
+        async with client.stream("GET", f"{base_url}/v1/jobs/{job_id}/artifacts/{name}") as r:
+            if r.status_code >= 400:
+                raise RemoteTranscriberError(f"failed to download artifact {name}: {r.status_code} {await r.aread()!r}")
+            expected_length = _expected_content_length(r)
+            with part.open("wb") as fh:
+                async for chunk in r.aiter_bytes():
+                    fh.write(chunk)
+                    total += len(chunk)
+    except RemoteTranscriberError:
+        raise
+    except (httpx.HTTPError, OSError, RuntimeError) as exc:
+        # See the sync downloader: a failure up to and including stream
+        # close aborts the round; the staging context sweeps the .part.
+        raise RemoteTranscriberError(f"download interrupted for artifact {name}: {exc}") from exc
+    _verify_downloaded(part, name, total, expected_length)
+    os.replace(part, stage.path / name)
 
 
 def transcribe_remote(
@@ -151,19 +256,17 @@ def transcribe_remote(
             stem = Path(base).stem if not is_url else (base or "remote")
             output_dir = f"text_{stem or 'remote'}"
         out_path = Path(output_dir).resolve()
-        out_path.mkdir(parents=True, exist_ok=True)
 
         artifacts = job.get("artifacts") or []
         if not artifacts:
             raise RemoteTranscriberError(f"daemon job {job_id} reported no artifacts")
-        for name in artifacts:
-            dest = out_path / name
-            with client.stream("GET", f"{base_url}/v1/jobs/{job_id}/artifacts/{name}") as r:
-                if r.status_code >= 400:
-                    raise RemoteTranscriberError(f"failed to download artifact {name}: {r.status_code} {r.text}")
-                with dest.open("wb") as fh:
-                    for chunk in r.iter_bytes():
-                        fh.write(chunk)
+        # Download into a hidden staging directory, validate the complete
+        # set, then atomically publish. An interrupted download leaves
+        # the previous complete round in out_path untouched.
+        with staged_round(out_path) as stage:
+            for name in artifacts:
+                _download_artifact_sync(client, base_url, job_id, name, stage)
+            _publish_downloaded_round(stage, artifacts)
         return str(out_path)
     finally:
         client.close()
@@ -251,19 +354,15 @@ async def transcribe_remote_async(
             stem = Path(base).stem if not is_url else (base or "remote")
             output_dir = f"text_{stem or 'remote'}"
         out_path = Path(output_dir).resolve()
-        out_path.mkdir(parents=True, exist_ok=True)
 
         artifacts = job.get("artifacts") or []
         if not artifacts:
             raise RemoteTranscriberError(f"daemon job {job_id} reported no artifacts")
-        for name in artifacts:
-            dest = out_path / name
-            async with client.stream("GET", f"{base_url}/v1/jobs/{job_id}/artifacts/{name}") as r:
-                if r.status_code >= 400:
-                    raise RemoteTranscriberError(f"failed to download artifact {name}: {r.status_code} {await r.aread()!r}")
-                with dest.open("wb") as fh:
-                    async for chunk in r.aiter_bytes():
-                        fh.write(chunk)
+        # Same staging/validate/publish protocol as the sync client.
+        with staged_round(out_path) as stage:
+            for name in artifacts:
+                await _download_artifact_async(client, base_url, job_id, name, stage)
+            _publish_downloaded_round(stage, artifacts)
         return str(out_path)
 
 

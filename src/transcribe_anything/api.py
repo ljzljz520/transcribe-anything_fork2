@@ -26,6 +26,7 @@ from appdirs import user_config_dir  # type: ignore
 from transcribe_anything.audio import fetch_audio
 from transcribe_anything.insanely_fast_whisper import run_insanely_fast_whisper
 from transcribe_anything.logger import log_error
+from transcribe_anything.publish import commit_round, staged_round
 from transcribe_anything.util import (
     chop_double_extension,
     get_static_ffmpeg_runtime_dir,
@@ -343,7 +344,12 @@ def transcribe(
             print(f"Using initial prompt: {initial_prompt[:100]}{'...' if len(initial_prompt) > 100 else ''}")
 
         print(f"Running whisper on {tmp_wav} (will install models on first run)")
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # Build the whole round inside a hidden staging directory and only
+        # publish the validated complete set. An interruption at any point
+        # leaves the previous complete round (or the new complete round
+        # after recovery) in output_dir — never a partial mix.
+        with staged_round(output_dir) as stage:
+            tmpdir = str(stage.path)
             if device_enum in (Device.INSANE, Device.INSANE_FLASH, Device.XPU):
                 run_insanely_fast_whisper(
                     input_wav=Path(tmp_wav),
@@ -418,22 +424,27 @@ def transcribe(
                 new_file = os.path.join(base_path, chop_double_extension(file_name))
                 _, ext = os.path.splitext(new_file)
                 if "speaker.json" in new_file:  # pass through speaker.json
-                    outfile = os.path.join(output_dir, "speaker.json")
+                    outfile = os.path.join(tmpdir, "speaker.json")
                 else:
-                    outfile = os.path.join(output_dir, f"out{ext}")
-                if os.path.exists(outfile):
-                    os.remove(outfile)
+                    outfile = os.path.join(tmpdir, f"out{ext}")
                 assert os.path.isfile(file), f"Path {file} doesn't exist."
-                assert not os.path.exists(outfile), f"Path {outfile} already exists."
-                shutil.move(file, outfile)
+                if os.path.abspath(file) != os.path.abspath(outfile):
+                    # Normalization happens inside staging now, so a file
+                    # already carrying its final name (speaker.json) is
+                    # neither removed nor moved onto itself.
+                    if os.path.exists(outfile):
+                        os.remove(outfile)
+                    assert not os.path.exists(outfile), f"Path {outfile} already exists."
+                    shutil.move(file, outfile)
                 if ext == ".srt":
                     srt_file = outfile
-            output_dir = os.path.abspath(output_dir)
             assert srt_file is not None, "No srt file found."
             srt_file = os.path.abspath(srt_file)
             if embed:
+                # Burn into staging: a failed/interrupted ffmpeg run must
+                # never touch the previous round's out.mp4.
                 assert os.path.isfile(url_or_file), f"Path {url_or_file} doesn't exist."
-                out_mp4 = os.path.join(output_dir, "out.mp4")
+                out_mp4 = os.path.join(tmpdir, "out.mp4")
                 static_ffmpeg_path = shutil.which("static_ffmpeg")
                 if static_ffmpeg_path is None:
                     raise FileNotFoundError("static_ffmpeg not found")
@@ -444,6 +455,11 @@ def transcribe(
                     stderr = exc.stderr
                     warnings.warn(f"ffmpeg failed with return code {exc.returncode}\n{stdout}\n{stderr}")
                     raise
+            # Validate the staged set (requires a non-empty out.srt) and
+            # atomically publish it; stale managed files are removed and
+            # user files preserved by the publish protocol.
+            commit_round(stage)
+        output_dir = os.path.abspath(output_dir)
         print(f"Done! Files were saved to {output_dir}")
         return output_dir
     finally:

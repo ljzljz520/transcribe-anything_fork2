@@ -358,6 +358,44 @@ def test_artifacts_zip_returns_404_for_unknown_job(server_client) -> None:
     assert r.status_code == 404
 
 
+def test_internal_round_entries_never_exposed(server_client, tmp_path) -> None:
+    """Staging dirs, journals and lock dirs stay invisible to HTTP clients."""
+    import io
+    import zipfile
+
+    client, _ = server_client
+    resp = client.post("/v1/transcribe", json={"url": "https://x"})
+    job_id = resp.json()["job_id"]
+    final = _wait_for_status(client, job_id)
+    assert final["status"] == "completed"
+
+    # Plant internal bookkeeping entries straight onto the job's disk.
+    matches = list((tmp_path / "jobs").glob("**/out.txt"))
+    assert matches, "job artifact dir not found"
+    artifact_dir = matches[0].parent
+    (artifact_dir / ".staging-leftover").mkdir()
+    (artifact_dir / ".staging-leftover" / "out.srt").write_text("partial", encoding="utf-8")
+    (artifact_dir / ".transcribe-round.json").write_text('{"round_id": "x"}', encoding="utf-8")
+    (artifact_dir / ".transcribe-round.lock").mkdir()
+
+    state = client.get(f"/v1/jobs/{job_id}").json()
+    assert set(state["artifacts"]) == {"out.txt", "out.srt", "out.vtt", "out.json"}
+
+    r = client.get(f"/v1/jobs/{job_id}/artifacts.zip")
+    assert r.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        names = set(zf.namelist())
+    assert names == {"out.txt", "out.srt", "out.vtt", "out.json"}
+
+    for hidden in (".transcribe-round.json", ".transcribe-round.lock"):
+        got = client.get(f"/v1/jobs/{job_id}/artifacts/{hidden}")
+        assert got.status_code == 404, f"{hidden} leaked with {got.status_code}"
+
+    # Sanity: a real artifact still serves.
+    ok = client.get(f"/v1/jobs/{job_id}/artifacts/out.txt")
+    assert ok.status_code == 200
+
+
 # --------------------- /metrics endpoint ---------------------
 
 
